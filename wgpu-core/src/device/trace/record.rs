@@ -872,9 +872,13 @@ fn action_to_owned(action: Action<'_, PointerReferences>) -> Action<'static, Poi
         A::DropExternalTexture(external_texture) => A::DropExternalTexture(external_texture),
         A::DropSampler(sampler) => A::DropSampler(sampler),
         A::GetSurfaceTexture { id, parent } => A::GetSurfaceTexture { id, parent },
-        A::Present(surface) => A::Present(surface),
-        A::DiscardSurfaceTexture(surface) => A::DiscardSurfaceTexture(surface),
-        A::ReleaseSurfaceTexture(surface) => A::ReleaseSurfaceTexture(surface),
+        A::Present { surface, texture } => A::Present { surface, texture },
+        A::DiscardSurfaceTexture { surface, texture } => {
+            A::DiscardSurfaceTexture { surface, texture }
+        }
+        A::ReleaseSurfaceTexture { surface, texture } => {
+            A::ReleaseSurfaceTexture { surface, texture }
+        }
         A::DropBindGroupLayout(layout) => A::DropBindGroupLayout(layout),
         A::GetRenderPipelineBindGroupLayout {
             id,

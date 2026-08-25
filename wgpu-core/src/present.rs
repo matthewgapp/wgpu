@@ -25,7 +25,7 @@ use crate::{
 use thiserror::Error;
 use wgt::{
     error::{ErrorType, WebGpuError},
-    SurfaceStatus as Status,
+    PresentationFeedbackError, PresentationFeedbackResult, SurfaceStatus as Status,
 };
 
 const FRAME_TIMEOUT_MS: u32 = 1000;
@@ -52,6 +52,8 @@ pub enum SurfaceError {
     NothingToPresent,
     #[error("Texture has been destroyed")]
     TextureDestroyed,
+    #[error("Surface image does not match the exact acquired texture")]
+    AcquiredTextureMismatch,
 }
 
 impl WebGpuError for SurfaceError {
@@ -62,9 +64,117 @@ impl WebGpuError for SurfaceError {
             | Self::NotConfigured
             | Self::AlreadyAcquired
             | Self::NothingToPresent
-            | Self::TextureDestroyed => ErrorType::Validation,
+            | Self::TextureDestroyed
+            | Self::AcquiredTextureMismatch => ErrorType::Validation,
         }
     }
+}
+
+enum PresentationFeedbackGateState {
+    Closed {
+        callback: Option<hal::PresentationFeedbackCallback>,
+        result: Option<PresentationFeedbackResult>,
+    },
+    Open {
+        callback: Option<hal::PresentationFeedbackCallback>,
+    },
+    Complete,
+}
+
+struct PresentationFeedbackGate {
+    state: wgpu_sync::Mutex<PresentationFeedbackGateState>,
+}
+
+impl PresentationFeedbackGate {
+    fn new(callback: hal::PresentationFeedbackCallback) -> Arc<Self> {
+        Arc::new(Self {
+            state: wgpu_sync::Mutex::new(PresentationFeedbackGateState::Closed {
+                callback: Some(callback),
+                result: None,
+            }),
+        })
+    }
+
+    fn complete(&self, result: PresentationFeedbackResult) {
+        let callback = {
+            let mut state = self.state.lock();
+            match &mut *state {
+                PresentationFeedbackGateState::Closed {
+                    result: pending, ..
+                } => {
+                    if pending.is_none() {
+                        *pending = Some(result);
+                    } else {
+                        log::warn!("presentation feedback completed more than once");
+                    }
+                    None
+                }
+                PresentationFeedbackGateState::Open { callback } => {
+                    let callback = callback.take();
+                    *state = PresentationFeedbackGateState::Complete;
+                    callback
+                }
+                PresentationFeedbackGateState::Complete => {
+                    log::warn!("presentation feedback completed more than once");
+                    None
+                }
+            }
+        };
+
+        if let Some(callback) = callback {
+            callback(result);
+        }
+    }
+
+    fn open(&self) {
+        let completion = {
+            let mut state = self.state.lock();
+            match &mut *state {
+                PresentationFeedbackGateState::Closed { callback, result } => {
+                    if let Some(result) = result.take() {
+                        let callback = callback.take();
+                        *state = PresentationFeedbackGateState::Complete;
+                        callback.map(|callback| (callback, result))
+                    } else {
+                        let callback = callback.take();
+                        *state = PresentationFeedbackGateState::Open { callback };
+                        None
+                    }
+                }
+                PresentationFeedbackGateState::Open { .. }
+                | PresentationFeedbackGateState::Complete => None,
+            }
+        };
+
+        if let Some((callback, result)) = completion {
+            callback(result);
+        }
+    }
+}
+
+fn feedback_error(error: &SurfaceError) -> PresentationFeedbackError {
+    match error {
+        SurfaceError::Device(DeviceError::Lost) => PresentationFeedbackError::DeviceLost,
+        SurfaceError::Device(DeviceError::OutOfMemory) => PresentationFeedbackError::OutOfMemory,
+        SurfaceError::Device(DeviceError::DeviceMismatch(_))
+        | SurfaceError::Invalid
+        | SurfaceError::NotConfigured
+        | SurfaceError::AlreadyAcquired
+        | SurfaceError::NothingToPresent
+        | SurfaceError::TextureDestroyed
+        | SurfaceError::AcquiredTextureMismatch => PresentationFeedbackError::Validation,
+    }
+}
+
+fn take_exact_acquisition<T>(
+    acquired: &mut Option<Arc<T>>,
+    expected: Option<&Arc<T>>,
+) -> Result<Arc<T>, SurfaceError> {
+    let current = acquired.as_ref().ok_or(SurfaceError::NothingToPresent)?;
+    if expected.is_some_and(|expected| !Arc::ptr_eq(current, expected)) {
+        return Err(SurfaceError::AcquiredTextureMismatch);
+    }
+    Ok(acquired.take().unwrap())
 }
 
 #[derive(Clone, Debug, Error)]
@@ -293,12 +403,6 @@ impl Surface {
     }
 
     pub fn present(self: &Arc<Self>) -> Result<Status, SurfaceError> {
-        #[cfg(feature = "trace")]
-        if let Some(present) = self.presentation.lock().as_ref() {
-            if let Some(ref mut trace) = *present.device.trace.lock() {
-                trace.add(Action::Present(self.to_trace()));
-            }
-        }
         self.present_inner()
     }
 
@@ -326,7 +430,64 @@ impl Queue {
     pub fn present(&self, surface: &Surface) -> Result<Status, SurfaceError> {
         profiling::scope!("Queue::present");
 
-        let texture = {
+        let texture = self.take_surface_texture(surface, None)?;
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *self.device.trace.lock() {
+            trace.add(Action::Present {
+                surface: unsafe { crate::device::trace::to_trace(surface) },
+                texture: texture.to_trace(),
+            });
+        }
+
+        self.present_surface_texture(surface, texture)
+    }
+
+    #[doc(hidden)]
+    pub fn present_acquired(
+        &self,
+        surface: &Surface,
+        expected: &Arc<resource::Texture>,
+    ) -> Result<Status, SurfaceError> {
+        profiling::scope!("Queue::present_acquired");
+
+        let texture = self.take_surface_texture(surface, Some(expected))?;
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *self.device.trace.lock() {
+            trace.add(Action::Present {
+                surface: unsafe { crate::device::trace::to_trace(surface) },
+                texture: texture.to_trace(),
+            });
+        }
+
+        self.present_surface_texture(surface, texture)
+    }
+
+    #[doc(hidden)]
+    pub fn present_acquired_with_feedback(
+        &self,
+        surface: &Surface,
+        expected: &Arc<resource::Texture>,
+        callback: hal::PresentationFeedbackCallback,
+    ) -> Result<Status, SurfaceError> {
+        profiling::scope!("Queue::present_acquired_with_feedback");
+
+        let gate = PresentationFeedbackGate::new(callback);
+        let result = self.present_acquired_with_feedback_inner(surface, expected, &gate);
+        if let Err(error) = &result {
+            gate.complete(Err(feedback_error(error)));
+        }
+        gate.open();
+        result
+    }
+
+    fn take_surface_texture(
+        &self,
+        surface: &Surface,
+        expected: Option<&Arc<resource::Texture>>,
+    ) -> Result<Arc<resource::Texture>, SurfaceError> {
+        {
             let mut presentation = surface.presentation.lock();
             let present = match presentation.as_mut() {
                 Some(present) => present,
@@ -347,12 +508,15 @@ impl Queue {
                 ))));
             }
 
-            present
-                .acquired_texture
-                .take()
-                .ok_or(SurfaceError::NothingToPresent)?
-        };
+            take_exact_acquisition(&mut present.acquired_texture, expected)
+        }
+    }
 
+    fn present_surface_texture(
+        &self,
+        surface: &Surface,
+        texture: Arc<resource::Texture>,
+    ) -> Result<Status, SurfaceError> {
         // If the texture was never rendered to, clear it and transition to
         // PRESENT state before presenting.
         // Fixes <https://github.com/gfx-rs/wgpu/issues/6748>
@@ -398,20 +562,105 @@ impl Queue {
             },
         }
     }
+
+    fn present_acquired_with_feedback_inner(
+        &self,
+        surface: &Surface,
+        expected: &Arc<resource::Texture>,
+        gate: &Arc<PresentationFeedbackGate>,
+    ) -> Result<Status, SurfaceError> {
+        let texture = self.take_surface_texture(surface, Some(expected))?;
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *self.device.trace.lock() {
+            trace.add(Action::Present {
+                surface: unsafe { crate::device::trace::to_trace(surface) },
+                texture: texture.to_trace(),
+            });
+        }
+
+        self.prepare_surface_texture_for_present(&texture)?;
+
+        let device = &self.device;
+        let mut exclusive_snatch_guard = device.snatchable_lock.write();
+        let inner = texture
+            .state()
+            .ok()
+            .and_then(|state| state.inner.snatch(&mut exclusive_snatch_guard));
+        drop(exclusive_snatch_guard);
+
+        let result = match inner {
+            None => return Err(SurfaceError::TextureDestroyed),
+            Some(resource::TextureInner::Surface { raw }) => {
+                let raw_surface = surface.raw(device.backend()).unwrap();
+                let raw_queue = self.raw();
+                let command_indices = device.command_indices.write();
+                let hal_gate = Arc::clone(gate);
+                let result = unsafe {
+                    raw_queue.present_with_feedback(
+                        raw_surface,
+                        raw,
+                        Box::new(move |result| hal_gate.complete(result)),
+                    )
+                };
+                drop(command_indices);
+                result
+            }
+            _ => unreachable!(),
+        };
+
+        match result {
+            Ok(()) => Ok(Status::Good),
+            Err(err) => {
+                let feedback = match &err {
+                    hal::SurfaceError::Timeout | hal::SurfaceError::Occluded => {
+                        Ok(wgt::PresentationFeedback::NotPresented)
+                    }
+                    hal::SurfaceError::Lost | hal::SurfaceError::Outdated => {
+                        Err(PresentationFeedbackError::SurfaceLost)
+                    }
+                    hal::SurfaceError::Device(hal::DeviceError::OutOfMemory) => {
+                        Err(PresentationFeedbackError::OutOfMemory)
+                    }
+                    hal::SurfaceError::Device(
+                        hal::DeviceError::Lost | hal::DeviceError::Unexpected,
+                    ) => Err(PresentationFeedbackError::DeviceLost),
+                    hal::SurfaceError::Other(_) => Err(PresentationFeedbackError::ProtocolFailure),
+                };
+                gate.complete(feedback);
+
+                match err {
+                    hal::SurfaceError::Timeout => Ok(Status::Timeout),
+                    hal::SurfaceError::Occluded => Ok(Status::Occluded),
+                    hal::SurfaceError::Lost => Ok(Status::Lost),
+                    hal::SurfaceError::Device(err) => {
+                        Err(SurfaceError::from(device.handle_hal_error(err)))
+                    }
+                    hal::SurfaceError::Outdated => Ok(Status::Outdated),
+                    hal::SurfaceError::Other(msg) => {
+                        log::error!("present error: {msg}");
+                        Err(SurfaceError::Invalid)
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Surface {
     pub fn discard(self: &Arc<Self>) -> Result<(), SurfaceError> {
-        #[cfg(feature = "trace")]
-        if let Some(present) = self.presentation.lock().as_ref() {
-            if let Some(ref mut trace) = *present.device.trace.lock() {
-                trace.add(Action::DiscardSurfaceTexture(self.to_trace()));
-            }
-        }
-        self.discard_inner()
+        self.discard_inner(None)
     }
 
-    pub(crate) fn discard_inner(&self) -> Result<(), SurfaceError> {
+    #[doc(hidden)]
+    pub fn discard_acquired(&self, expected: &Arc<resource::Texture>) -> Result<(), SurfaceError> {
+        self.discard_inner(Some(expected))
+    }
+
+    pub(crate) fn discard_inner(
+        &self,
+        expected: Option<&Arc<resource::Texture>>,
+    ) -> Result<(), SurfaceError> {
         profiling::scope!("Surface::discard");
 
         let mut presentation = self.presentation.lock();
@@ -424,10 +673,15 @@ impl Surface {
 
         device.check_is_valid()?;
 
-        let texture = present
-            .acquired_texture
-            .take()
-            .ok_or(SurfaceError::NothingToPresent)?;
+        let texture = take_exact_acquisition(&mut present.acquired_texture, expected)?;
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *device.trace.lock() {
+            trace.add(Action::DiscardSurfaceTexture {
+                surface: unsafe { crate::device::trace::to_trace(self) },
+                texture: texture.to_trace(),
+            });
+        }
 
         let mut exclusive_snatch_guard = device.snatchable_lock.write();
         let inner = texture
@@ -449,18 +703,20 @@ impl Surface {
     }
 
     pub fn release(self: &Arc<Self>) -> Result<(), SurfaceError> {
-        #[cfg(feature = "trace")]
-        if let Some(present) = self.presentation.lock().as_ref() {
-            if let Some(ref mut trace) = *present.device.trace.lock() {
-                trace.add(Action::ReleaseSurfaceTexture(self.to_trace()));
-            }
-        }
-        self.release_inner()
+        self.release_inner(None)
+    }
+
+    #[doc(hidden)]
+    pub fn release_acquired(&self, expected: &Arc<resource::Texture>) -> Result<(), SurfaceError> {
+        self.release_inner(Some(expected))
     }
 
     /// Like `discard`, drops the inner texture reference, but skips the
     /// HAL `discard_texture` call. Safe to call during unwinding
-    pub(crate) fn release_inner(&self) -> Result<(), SurfaceError> {
+    pub(crate) fn release_inner(
+        &self,
+        expected: Option<&Arc<resource::Texture>>,
+    ) -> Result<(), SurfaceError> {
         profiling::scope!("Surface::release");
 
         let mut presentation = self.presentation.lock();
@@ -468,15 +724,82 @@ impl Surface {
             return Err(SurfaceError::NotConfigured);
         };
 
+        let texture = take_exact_acquisition(&mut present.acquired_texture, expected)?;
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *present.device.trace.lock() {
+            trace.add(Action::ReleaseSurfaceTexture {
+                surface: unsafe { crate::device::trace::to_trace(self) },
+                texture: texture.to_trace(),
+            });
+        }
+
         // `texture` is dropped here, decrementing the refcount of
         // Arc<SwapchainAcquireSemaphore>. If this was the last Arc, the Texture
         // is freed, which drops NativeSurfaceTextureMetadata and
         // its Arc<SwapchainAcquireSemaphore>.
-        _ = present
-            .acquired_texture
-            .take()
-            .ok_or(SurfaceError::NothingToPresent)?;
+        drop(texture);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod presentation_feedback_tests {
+    use super::*;
+
+    #[test]
+    fn synchronous_completion_waits_until_gate_opens() {
+        let results = Arc::new(wgpu_sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&results);
+        let gate = PresentationFeedbackGate::new(Box::new(move |result| {
+            captured.lock().push(result);
+        }));
+
+        gate.complete(Ok(wgt::PresentationFeedback::NotPresented));
+        assert!(results.lock().is_empty());
+        gate.open();
+        assert_eq!(
+            *results.lock(),
+            [Ok(wgt::PresentationFeedback::NotPresented)]
+        );
+    }
+
+    #[test]
+    fn asynchronous_completion_after_open_is_exactly_once() {
+        let results = Arc::new(wgpu_sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&results);
+        let gate = PresentationFeedbackGate::new(Box::new(move |result| {
+            captured.lock().push(result);
+        }));
+
+        gate.open();
+        gate.complete(Ok(wgt::PresentationFeedback::NotPresented));
+        gate.complete(Err(PresentationFeedbackError::ProtocolFailure));
+        assert_eq!(
+            *results.lock(),
+            [Ok(wgt::PresentationFeedback::NotPresented)]
+        );
+    }
+
+    #[test]
+    fn stale_acquisition_cannot_consume_a_later_texture() {
+        let first = Arc::new(());
+        let second = Arc::new(());
+        let mut acquired = Some(Arc::clone(&second));
+
+        assert!(matches!(
+            take_exact_acquisition(&mut acquired, Some(&first)),
+            Err(SurfaceError::AcquiredTextureMismatch)
+        ));
+        assert!(Arc::ptr_eq(acquired.as_ref().unwrap(), &second));
+        assert!(Arc::ptr_eq(
+            &take_exact_acquisition(&mut acquired, Some(&second)).unwrap(),
+            &second
+        ));
+        assert!(matches!(
+            take_exact_acquisition(&mut acquired, Some(&second)),
+            Err(SurfaceError::NothingToPresent)
+        ));
     }
 }

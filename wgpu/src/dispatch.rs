@@ -65,6 +65,11 @@ pub type BoxSubmittedWorkDoneCallback = Box<dyn FnOnce() + Send + 'static>;
 #[cfg(not(send_sync))]
 pub type BoxSubmittedWorkDoneCallback = Box<dyn FnOnce() + 'static>;
 #[cfg(send_sync)]
+pub type PresentationFeedbackCallback =
+    Box<dyn FnOnce(wgt::PresentationFeedbackResult) + Send + 'static>;
+#[cfg(not(send_sync))]
+pub type PresentationFeedbackCallback = Box<dyn FnOnce(wgt::PresentationFeedbackResult) + 'static>;
+#[cfg(send_sync)]
 pub type BufferMapCallback = Box<dyn FnOnce(Result<(), crate::BufferAsyncError>) + Send + 'static>;
 #[cfg(not(send_sync))]
 pub type BufferMapCallback = Box<dyn FnOnce(Result<(), crate::BufferAsyncError>) + 'static>;
@@ -263,6 +268,15 @@ pub trait QueueInterface: CommonTraits {
     fn compact_blas(&self, blas: &DispatchBlas) -> (Option<u64>, DispatchBlas);
 
     fn present(&self, detail: &DispatchSurfaceOutputDetail);
+
+    fn present_with_feedback(
+        &self,
+        detail: &DispatchSurfaceOutputDetail,
+        callback: PresentationFeedbackCallback,
+    ) {
+        self.present(detail);
+        callback(Err(wgt::PresentationFeedbackError::Unsupported));
+    }
 }
 
 pub trait ShaderModuleInterface: CommonTraits {

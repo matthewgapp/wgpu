@@ -290,6 +290,7 @@ pub use wgt::{
     MemoryBudgetThresholds, MemoryHints, MipmapFilterMode, MultisampleState, NoopBackendOptions,
     Origin2d, Origin3d, PassthroughShaderEntryPoint, PipelineStatisticsTypes, PollError,
     PollStatus, PolygonMode, PowerPreference, PredefinedColorSpace, PresentMode,
+    PresentationFeedback, PresentationFeedbackError, PresentationFeedbackResult,
     PresentationTimestamp, PrimitiveState, PrimitiveTopology, QueryType, RenderBundleDepthStencil,
     RequestAdapterError, SamplerBindingType, SamplerBorderColor, ShaderLocation, ShaderModel,
     ShaderRuntimeChecks, ShaderStages, StencilFaceState, StencilOperation, StencilState,

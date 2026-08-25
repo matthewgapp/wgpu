@@ -198,15 +198,24 @@ fn main() {
                                 );
                                 self.player.get_surface_texture(id, surface);
                             }
-                            Some(trace::Action::Present(_id)) => {
+                            Some(trace::Action::Present {
+                                surface: _surface_id,
+                                texture,
+                            }) => {
                                 self.frame_count += 1;
                                 log::debug!("Presenting frame {}", self.frame_count);
-                                surface.present().unwrap();
+                                let texture = self.player.resolve_texture_id(texture);
+                                let queue = self.queue;
+                                queue.present_acquired(surface, &texture).unwrap();
                                 break;
                             }
-                            Some(trace::Action::DiscardSurfaceTexture(_id)) => {
+                            Some(trace::Action::DiscardSurfaceTexture {
+                                surface: _surface_id,
+                                texture,
+                            }) => {
                                 log::debug!("Discarding frame {}", self.frame_count);
-                                surface.discard().unwrap();
+                                let texture = self.player.resolve_texture_id(texture);
+                                surface.discard_acquired(&texture).unwrap();
                                 break;
                             }
                             Some(action) => {

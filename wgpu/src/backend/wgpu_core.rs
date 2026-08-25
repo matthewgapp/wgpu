@@ -499,6 +499,7 @@ pub struct CoreTlas {
 pub struct CoreSurfaceOutputDetail {
     pub(crate) context: ContextWgpuCore,
     wgpu_surface: Arc<wgc::instance::Surface>,
+    acquired_texture: Option<Arc<wgc::resource::Texture>>,
     error_sink: ErrorSink,
 }
 
@@ -1767,13 +1768,39 @@ impl dispatch::QueueInterface for CoreQueue {
 
     fn present(&self, detail: &dispatch::DispatchSurfaceOutputDetail) {
         let detail = detail.as_core();
-        match detail.wgpu_surface.present() {
+        let result = match detail.acquired_texture.as_ref() {
+            Some(texture) => self
+                .wgpu_queue
+                .present_acquired(&detail.wgpu_surface, texture),
+            None => Err(wgc::present::SurfaceError::NothingToPresent),
+        };
+        match result {
             Ok(_status) => (),
             Err(err) => {
                 self.wgpu_queue
                     .device()
                     .handle_error_nolabel(err, "Queue::present");
             }
+        }
+    }
+
+    fn present_with_feedback(
+        &self,
+        detail: &dispatch::DispatchSurfaceOutputDetail,
+        callback: dispatch::PresentationFeedbackCallback,
+    ) {
+        let detail = detail.as_core();
+        let Some(texture) = detail.acquired_texture.as_ref() else {
+            callback(Err(crate::PresentationFeedbackError::Validation));
+            return;
+        };
+        if let Err(err) =
+            self.wgpu_queue
+                .present_acquired_with_feedback(&detail.wgpu_surface, texture, callback)
+        {
+            self.wgpu_queue
+                .device()
+                .handle_error_nolabel(err, "Queue::present_with_feedback");
         }
     }
 }
@@ -2919,28 +2946,37 @@ impl dispatch::SurfaceInterface for CoreSurface {
             ErrorSink::new()
         };
 
-        let output_detail = CoreSurfaceOutputDetail {
-            context: self.context.clone(),
-            wgpu_surface: self.wgpu_surface.clone(),
-            error_sink,
-        }
-        .into();
-
         match self.wgpu_surface.get_current_texture() {
             Ok(wgc::present::SurfaceOutput {
                 status,
                 texture: texture_id,
             }) => {
-                let data = texture_id
+                let acquired_texture = texture_id;
+                let data = acquired_texture
+                    .as_ref()
                     .map(|wgpu_texture| CoreTexture {
                         context: self.context.clone(),
-                        wgpu_texture,
+                        wgpu_texture: wgpu_texture.clone(),
                     })
                     .map(Into::into);
+                let output_detail = CoreSurfaceOutputDetail {
+                    context: self.context.clone(),
+                    wgpu_surface: self.wgpu_surface.clone(),
+                    acquired_texture,
+                    error_sink,
+                }
+                .into();
 
                 (data, status, output_detail)
             }
             Err(err) => {
+                let output_detail = CoreSurfaceOutputDetail {
+                    context: self.context.clone(),
+                    wgpu_surface: self.wgpu_surface.clone(),
+                    acquired_texture: None,
+                    error_sink,
+                }
+                .into();
                 let error_sink = self.configured_device.lock();
                 match error_sink.as_ref() {
                     Some(error_sink) => {
@@ -2958,7 +2994,11 @@ impl dispatch::SurfaceInterface for CoreSurface {
 
 impl dispatch::SurfaceOutputDetailInterface for CoreSurfaceOutputDetail {
     fn texture_discard(&self) {
-        match self.wgpu_surface.discard() {
+        let result = match self.acquired_texture.as_ref() {
+            Some(texture) => self.wgpu_surface.discard_acquired(texture),
+            None => Err(wgc::present::SurfaceError::NothingToPresent),
+        };
+        match result {
             Ok(_status) => (),
             Err(err) => self
                 .error_sink
@@ -2967,7 +3007,11 @@ impl dispatch::SurfaceOutputDetailInterface for CoreSurfaceOutputDetail {
     }
 
     fn texture_release(&self) {
-        match self.wgpu_surface.release() {
+        let result = match self.acquired_texture.as_ref() {
+            Some(texture) => self.wgpu_surface.release_acquired(texture),
+            None => Err(wgc::present::SurfaceError::NothingToPresent),
+        };
+        match result {
             Ok(_status) => (),
             Err(err) => self
                 .error_sink

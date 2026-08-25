@@ -104,9 +104,9 @@ impl Player {
                 panic!("Unexpected Action::Init: has to be the first action only")
             }
             Action::ConfigureSurface { .. }
-            | Action::Present(_)
-            | Action::DiscardSurfaceTexture(_)
-            | Action::ReleaseSurfaceTexture(_) => {
+            | Action::Present { .. }
+            | Action::DiscardSurfaceTexture { .. }
+            | Action::ReleaseSurfaceTexture { .. } => {
                 panic!("Unexpected Surface action: winit feature is not enabled")
             }
             Action::CreateBuffer(id, desc) => {
@@ -462,7 +462,7 @@ impl Player {
         self.buffers.get(&id).expect("invalid buffer").clone()
     }
 
-    fn resolve_texture_id(
+    pub fn resolve_texture_id(
         &self,
         id: wgc::id::PointerId<wgc::id::markers::Texture>,
     ) -> Arc<wgc::resource::Texture> {

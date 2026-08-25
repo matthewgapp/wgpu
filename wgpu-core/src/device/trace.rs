@@ -153,9 +153,18 @@ pub enum Action<'a, R: ReferenceType> {
         id: R::Texture,
         parent: R::Surface,
     },
-    Present(R::Surface),
-    DiscardSurfaceTexture(R::Surface),
-    ReleaseSurfaceTexture(R::Surface),
+    Present {
+        surface: R::Surface,
+        texture: R::Texture,
+    },
+    DiscardSurfaceTexture {
+        surface: R::Surface,
+        texture: R::Texture,
+    },
+    ReleaseSurfaceTexture {
+        surface: R::Surface,
+        texture: R::Texture,
+    },
     CreateBindGroupLayout(
         PointerId<markers::BindGroupLayout>,
         crate::binding_model::BindGroupLayoutDescriptor<'a>,

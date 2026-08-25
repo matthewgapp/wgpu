@@ -5,6 +5,7 @@
 //! space and HDR primer lives in the `wgpu` crate's top-level docs.
 
 use alloc::{vec, vec::Vec};
+use core::fmt;
 
 use macro_rules_attribute::derive;
 
@@ -1068,3 +1069,59 @@ impl PresentationTimestamp {
         self == Self::INVALID_TIMESTAMP
     }
 }
+
+/// Terminal feedback for one exact surface presentation.
+///
+/// This is stronger than successful acquisition, queue submission, GPU completion, or a
+/// successful return from the platform present operation. A backend reports this value only from
+/// terminal evidence for the exact acquired surface texture passed to presentation.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PresentationFeedback {
+    /// The exact surface texture was presented for external consumption.
+    Presented {
+        /// The backend's presentation clock timestamp.
+        timestamp: PresentationTimestamp,
+    },
+    /// The backend terminally reported that the exact surface texture was not presented.
+    NotPresented,
+}
+
+/// Failure to obtain terminal presentation feedback for one exact surface texture.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PresentationFeedbackError {
+    /// The active backend cannot provide terminal presentation evidence.
+    Unsupported,
+    /// Observation ended without terminal presentation evidence.
+    Cancelled,
+    /// The surface was lost or became outdated before presentation completed.
+    SurfaceLost,
+    /// The device was lost before presentation completed.
+    DeviceLost,
+    /// Presentation failed because the device ran out of memory.
+    OutOfMemory,
+    /// The exact surface presentation request failed validation.
+    Validation,
+    /// The backend returned contradictory or malformed terminal evidence.
+    ProtocolFailure,
+}
+
+impl fmt::Display for PresentationFeedbackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unsupported => "terminal presentation feedback is unsupported",
+            Self::Cancelled => "terminal presentation feedback was cancelled",
+            Self::SurfaceLost => "the presentation surface was lost",
+            Self::DeviceLost => "the presentation device was lost",
+            Self::OutOfMemory => "presentation ran out of memory",
+            Self::Validation => "the presentation request failed validation",
+            Self::ProtocolFailure => "the presentation backend returned invalid terminal feedback",
+        })
+    }
+}
+
+impl core::error::Error for PresentationFeedbackError {}
+
+/// Terminal result for one exact surface presentation.
+pub type PresentationFeedbackResult = Result<PresentationFeedback, PresentationFeedbackError>;
