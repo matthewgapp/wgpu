@@ -6,6 +6,10 @@ use crate::*;
 /// This type is unique to the Rust API of `wgpu`. In the WebGPU specification,
 /// the [`GPUCanvasContext`](https://gpuweb.github.io/gpuweb/#canvas-context) provides
 /// a texture without any additional information.
+///
+/// Clones share one exact acquisition. Presenting, discarding, or releasing through one clone
+/// consumes that acquisition for all siblings. A stale sibling can never act on a later surface
+/// texture acquired from the same surface.
 #[derive(Debug, Clone)]
 pub struct SurfaceTexture {
     /// Accessible view of the frame.

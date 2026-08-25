@@ -974,11 +974,15 @@ impl Surface {
                 }
 
                 // All textures must be destroyed before the surface can be re-configured.
-                if let Some(present) = self.presentation.lock().take() {
-                    if present.acquired_texture.is_some() {
-                        break 'error E::PreviousOutputExists;
-                    }
+                if self
+                    .presentation
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|present| present.acquired_texture.is_some())
+                {
+                    break 'error E::PreviousOutputExists;
                 }
+                drop(self.presentation.lock().take());
 
                 // TODO: Texture views may still be alive that point to the texture.
                 // this will allow the user to render to the surface texture, long after

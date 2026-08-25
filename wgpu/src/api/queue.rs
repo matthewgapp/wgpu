@@ -383,6 +383,23 @@ impl Queue {
         self.inner.present(&surface_texture.detail);
     }
 
+    /// Schedule a surface texture for presentation and observe its terminal display outcome.
+    ///
+    /// This consumes the same exact acquired surface texture capability as [`Queue::present`].
+    /// Successful submission or a successful platform present call does not complete the returned
+    /// future as presented. Backends without terminal display evidence resolve it as unsupported
+    /// after performing the ordinary presentation operation.
+    pub fn present_with_feedback(
+        &self,
+        mut surface_texture: SurfaceTexture,
+    ) -> PresentationFeedbackFuture {
+        surface_texture.presented = true;
+        let (future, callback) = PresentationFeedbackFuture::pending();
+        self.inner
+            .present_with_feedback(&surface_texture.detail, callback);
+        future
+    }
+
     /// Compact a BLAS, it must have had [`Blas::prepare_compaction_async`] called on it and had the
     /// callback provided called.
     ///
