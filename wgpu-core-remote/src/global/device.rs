@@ -5,7 +5,7 @@ use wgpu_core_remote_types::encoders::RenderBundleDescriptor;
 use wgpu_core::{
     binding_model::{self},
     command,
-    device::{DeviceLostClosure, WaitIdleError},
+    device::{DeviceLostClosure, MissingFeatures, WaitIdleError},
     error::EmptyErrorScopeStack,
     pipeline::{
         self, ProgrammableStageDescriptor, RenderPipelineVertexProcessor,
@@ -112,7 +112,7 @@ impl Global {
     /// [`GPUBufferDescriptor`]: https://www.w3.org/TR/webgpu/#dictdef-gpubufferdescriptor
     /// [`GPUBuffer`]: https://www.w3.org/TR/webgpu/#gpubuffer
     /// [`wgpu_types::BufferDescriptor`]: wgt::BufferDescriptor
-    /// [`Device::create_buffer`]: crate::device::Device::create_buffer
+    /// [`Device::create_buffer`]: wgpu_core::device::Device::create_buffer
     /// [`usage`]: https://www.w3.org/TR/webgpu/#dom-gputexturedescriptor-usage
     /// [`wgpu_types::BufferUsages`]: wgt::BufferUsages
     pub fn create_buffer_error(
@@ -363,9 +363,6 @@ impl Global {
         desc: &resource::ExternalTextureDescriptor,
         planes: &[id::TextureViewId],
         id_in: id::ExternalTextureId,
-    ) -> (
-        id::ExternalTextureId,
-        Option<resource::CreateExternalTextureError>,
     ) {
         let mut hub = self.hub.borrow_mut();
         let Hub {
@@ -382,11 +379,9 @@ impl Global {
             .map(|plane_id| texture_views.get(*plane_id))
             .collect::<Vec<_>>();
 
-        let (external_texture, error) = device.create_external_texture(desc, &planes);
+        let external_texture = device.create_external_texture(desc, &planes);
 
-        let id = external_textures.assign(id_in, external_texture);
-
-        (id, error)
+        external_textures.assign(id_in, external_texture);
     }
 
     pub fn external_texture_destroy(&self, external_texture_id: id::ExternalTextureId) {
@@ -408,7 +403,7 @@ impl Global {
         device_id: DeviceId,
         desc: &resource::SamplerDescriptor,
         id_in: id::SamplerId,
-    ) -> (id::SamplerId, Option<resource::CreateSamplerError>) {
+    ) {
         let mut hub = self.hub.borrow_mut();
         let Hub {
             samplers, devices, ..
@@ -416,11 +411,9 @@ impl Global {
 
         let device = devices.get(device_id);
 
-        let (sampler, error) = device.create_sampler(desc);
+        let sampler = device.create_sampler(desc);
 
-        let id = samplers.assign(id_in, sampler);
-
-        (id, error)
+        samplers.assign(id_in, sampler);
     }
 
     pub fn sampler_drop(&self, sampler_id: id::SamplerId) {
@@ -465,9 +458,6 @@ impl Global {
         device_id: DeviceId,
         desc: &binding_model::PipelineLayoutDescriptor<id::BindGroupLayoutId>,
         id_in: id::PipelineLayoutId,
-    ) -> (
-        id::PipelineLayoutId,
-        Option<binding_model::CreatePipelineLayoutError>,
     ) {
         let mut hub = self.hub.borrow_mut();
         let Hub {
@@ -491,9 +481,8 @@ impl Global {
             immediate_size: desc.immediate_size,
         };
 
-        let (layout, error) = device.create_pipeline_layout(&desc);
-        let id = pipeline_layouts.assign(id_in, layout);
-        (id, error)
+        let layout = device.create_pipeline_layout(&desc);
+        pipeline_layouts.assign(id_in, layout);
     }
 
     pub fn pipeline_layout_drop(&self, pipeline_layout_id: id::PipelineLayoutId) {
@@ -507,7 +496,7 @@ impl Global {
         device_id: DeviceId,
         desc: &BindGroupDescriptor,
         id_in: id::BindGroupId,
-    ) -> (id::BindGroupId, Option<binding_model::CreateBindGroupError>) {
+    ) {
         let mut hub = self.hub.borrow_mut();
         let Hub {
             bind_groups,
@@ -536,7 +525,7 @@ impl Global {
                 binding_model::BufferBinding {
                     buffer,
                     offset: bb.offset,
-                    size: bb.size,
+                    size: bb.size.to_std(),
                 }
             };
             let resolve_sampler = |id: &id::SamplerId| samplers.get(*id);
@@ -575,10 +564,9 @@ impl Global {
             entries,
         };
 
-        let (bind_group, error) = device.create_bind_group(&desc);
+        let bind_group = device.create_bind_group(&desc);
 
-        let id = bind_groups.assign(id_in, bind_group);
-        (id, error)
+        bind_groups.assign(id_in, bind_group);
     }
 
     pub fn bind_group_drop(&self, bind_group_id: id::BindGroupId) {
@@ -697,10 +685,7 @@ impl Global {
         device_id: DeviceId,
         desc: &command::RenderBundleEncoderDescriptor,
         id_in: id::RenderBundleEncoderId,
-    ) -> (
-        id::RenderBundleEncoderId,
-        Option<command::CreateRenderBundleError>,
-    ) {
+    ) -> Result<(), MissingFeatures> {
         let mut hub = self.hub.borrow_mut();
         let Hub {
             render_bundle_encoders,
@@ -709,11 +694,11 @@ impl Global {
         } = &mut *hub;
 
         let device = devices.get(device_id);
-        let (render_bundle_encoder, error) = device.create_render_bundle_encoder(desc);
+        let render_bundle_encoder = device.create_render_bundle_encoder(desc)?;
 
-        let id = render_bundle_encoders.assign(id_in, *render_bundle_encoder);
+        render_bundle_encoders.assign(id_in, *render_bundle_encoder);
 
-        (id, error)
+        Ok(())
     }
 
     pub fn render_bundle_encoder_finish(
@@ -869,9 +854,6 @@ impl Global {
         pipeline_id: id::RenderPipelineId,
         index: u32,
         id_in: id::BindGroupLayoutId,
-    ) -> (
-        id::BindGroupLayoutId,
-        Option<binding_model::GetBindGroupLayoutError>,
     ) {
         let mut hub = self.hub.borrow_mut();
         let Hub {
@@ -882,11 +864,9 @@ impl Global {
 
         let pipeline = render_pipelines.get(pipeline_id);
 
-        let (bgl, error) = pipeline.get_bind_group_layout(index);
+        let bgl = pipeline.get_bind_group_layout(index);
 
-        let id = bind_group_layouts.assign(id_in, bgl);
-
-        (id, error)
+        bind_group_layouts.assign(id_in, bgl);
     }
 
     pub fn render_pipeline_drop(&self, render_pipeline_id: id::RenderPipelineId) {
@@ -900,9 +880,6 @@ impl Global {
         device_id: DeviceId,
         desc: &ComputePipelineDescriptor,
         id_in: id::ComputePipelineId,
-    ) -> (
-        id::ComputePipelineId,
-        Option<pipeline::CreateComputePipelineError>,
     ) {
         let mut hub = self.hub.borrow_mut();
         let Hub {
@@ -936,11 +913,61 @@ impl Global {
             cache,
         };
 
-        let (pipeline, error) = device.create_compute_pipeline(desc);
+        let pipeline = device.create_compute_pipeline(desc);
 
-        let id = compute_pipelines.assign(id_in, pipeline);
+        compute_pipelines.assign(id_in, pipeline);
+    }
 
-        (id, error)
+    /// Error-returning version of `device_create_compute_pipeline` to implement
+    /// [GPUDevice.createComputePipelineAsync](https://gpuweb.github.io/gpuweb/#dom-gpudevice-createcomputepipelineasync).
+    /// Returns an error if the pipeline creation fails instead of handling error in device.
+    ///
+    /// Id is assigned to the pipeline only if the creation succeeds.
+    pub fn device_create_compute_pipeline_or_error(
+        &self,
+        device_id: DeviceId,
+        desc: &ComputePipelineDescriptor,
+        id_in: id::ComputePipelineId,
+    ) -> Result<(), pipeline::CreateComputePipelineError> {
+        let mut hub = self.hub.borrow_mut();
+        let Hub {
+            compute_pipelines,
+            devices,
+            shader_modules,
+            pipeline_layouts,
+            pipeline_caches,
+            ..
+        } = &mut *hub;
+
+        let device = devices.get(device_id);
+
+        let layout = desc.layout.map(|layout| pipeline_layouts.get(layout));
+
+        let cache = desc.cache.map(|cache| pipeline_caches.get(cache));
+
+        let module = shader_modules.get(desc.stage.module);
+
+        let stage = ProgrammableStageDescriptor {
+            module,
+            entry_point: desc.stage.entry_point.clone(),
+            constants: desc.stage.constants.clone(),
+            zero_initialize_workgroup_memory: desc.stage.zero_initialize_workgroup_memory,
+        };
+
+        let desc = pipeline::ComputePipelineDescriptor {
+            label: desc.label.clone(),
+            layout,
+            stage,
+            cache,
+        };
+
+        match device.create_compute_pipeline_or_error(desc) {
+            Ok(pipeline) => {
+                compute_pipelines.assign(id_in, pipeline);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Get an ID of one of the bind group layouts. The ID adds a refcount,
@@ -950,9 +977,6 @@ impl Global {
         pipeline_id: id::ComputePipelineId,
         index: u32,
         id_in: id::BindGroupLayoutId,
-    ) -> (
-        id::BindGroupLayoutId,
-        Option<binding_model::GetBindGroupLayoutError>,
     ) {
         let mut hub = self.hub.borrow_mut();
         let Hub {
@@ -963,11 +987,9 @@ impl Global {
 
         let pipeline = compute_pipelines.get(pipeline_id);
 
-        let (bgl, error) = pipeline.get_bind_group_layout(index);
+        let bgl = pipeline.get_bind_group_layout(index);
 
-        let id = bind_group_layouts.assign(id_in, bgl);
-
-        (id, error)
+        bind_group_layouts.assign(id_in, bgl);
     }
 
     pub fn compute_pipeline_drop(&self, compute_pipeline_id: id::ComputePipelineId) {
