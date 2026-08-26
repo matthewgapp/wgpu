@@ -545,14 +545,17 @@ impl Surface {
     }
 
     pub fn discard(&self) -> Result<(), SurfaceError> {
-        self.discard_inner(None)
+        self.discard_inner(None).map(|_| ())
     }
 
     pub fn discard_acquired(&self, expected: &Arc<resource::Texture>) -> Result<(), SurfaceError> {
-        self.discard_inner(Some(expected))
+        self.discard_inner(Some(expected)).map(|_| ())
     }
 
-    fn discard_inner(&self, expected: Option<&Arc<resource::Texture>>) -> Result<(), SurfaceError> {
+    fn discard_inner(
+        &self,
+        expected: Option<&Arc<resource::Texture>>,
+    ) -> Result<bool, SurfaceError> {
         profiling::scope!("Surface::discard");
 
         let mut presentation = self.presentation.lock();
@@ -570,7 +573,7 @@ impl Surface {
                 let Some(texture) =
                     take_exact_acquisition_for_discard(&mut present.acquired_texture, expected)
                 else {
-                    return Ok(());
+                    return Ok(false);
                 };
                 texture
             }
@@ -590,7 +593,7 @@ impl Surface {
             _ => unreachable!(),
         }
 
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -692,14 +695,20 @@ impl Global {
     pub fn surface_texture_discard(&self, surface_id: id::SurfaceId) -> Result<(), SurfaceError> {
         let surface = self.surfaces.get(surface_id);
 
+        let discarded = surface.discard_inner(None)?;
+
         #[cfg(feature = "trace")]
-        if let Some(present) = surface.presentation.lock().as_ref() {
-            if let Some(ref mut trace) = *present.device.trace.lock() {
-                trace.add(Action::DiscardSurfaceTexture(surface.to_trace()));
+        if discarded {
+            if let Some(present) = surface.presentation.lock().as_ref() {
+                if let Some(ref mut trace) = *present.device.trace.lock() {
+                    trace.add(Action::DiscardSurfaceTexture(surface.to_trace()));
+                }
             }
         }
+        #[cfg(not(feature = "trace"))]
+        let _ = discarded;
 
-        surface.discard()
+        Ok(())
     }
 
     pub fn surface_texture_discard_acquired(
@@ -715,14 +724,20 @@ impl Global {
             .get()
             .map_err(|_| SurfaceError::AcquiredTextureMismatch)?;
 
+        let discarded = surface.discard_inner(Some(&expected))?;
+
         #[cfg(feature = "trace")]
-        if let Some(present) = surface.presentation.lock().as_ref() {
-            if let Some(ref mut trace) = *present.device.trace.lock() {
-                trace.add(Action::DiscardSurfaceTexture(surface.to_trace()));
+        if discarded {
+            if let Some(present) = surface.presentation.lock().as_ref() {
+                if let Some(ref mut trace) = *present.device.trace.lock() {
+                    trace.add(Action::DiscardSurfaceTexture(surface.to_trace()));
+                }
             }
         }
+        #[cfg(not(feature = "trace"))]
+        let _ = discarded;
 
-        surface.discard_acquired(&expected)
+        Ok(())
     }
 }
 
@@ -790,13 +805,15 @@ mod presentation_feedback_tests {
         let first = Arc::new(());
         let second = Arc::new(());
         let mut acquired = Some(Arc::clone(&second));
+        let mut trace_cardinality = 0;
 
         assert!(take_exact_acquisition_for_discard(&mut acquired, &first).is_none());
         assert!(Arc::ptr_eq(acquired.as_ref().unwrap(), &second));
-        assert!(Arc::ptr_eq(
-            &take_exact_acquisition_for_discard(&mut acquired, &second).unwrap(),
-            &second
-        ));
+        if let Some(discarded) = take_exact_acquisition_for_discard(&mut acquired, &second) {
+            trace_cardinality += 1;
+            assert!(Arc::ptr_eq(&discarded, &second));
+        }
         assert!(take_exact_acquisition_for_discard(&mut acquired, &second).is_none());
+        assert_eq!(trace_cardinality, 1);
     }
 }
