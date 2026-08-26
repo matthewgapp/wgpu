@@ -613,6 +613,7 @@ pub struct CoreTlas {
 pub struct CoreSurfaceOutputDetail {
     context: ContextWgpuCore,
     surface_id: wgc::id::SurfaceId,
+    texture_id: Option<wgc::id::TextureId>,
     error_sink: ErrorSink,
 }
 
@@ -3896,29 +3897,36 @@ impl dispatch::SurfaceInterface for CoreSurface {
             Arc::new(Mutex::new(ErrorSinkRaw::new()))
         };
 
-        let output_detail = CoreSurfaceOutputDetail {
-            context: self.context.clone(),
-            surface_id: self.id,
-            error_sink: error_sink.clone(),
-        }
-        .into();
-
         match self.context.0.surface_get_current_texture(self.id, None) {
             Ok(wgc::present::SurfaceOutput {
                 status,
                 texture: texture_id,
             }) => {
+                let output_detail = CoreSurfaceOutputDetail {
+                    context: self.context.clone(),
+                    surface_id: self.id,
+                    texture_id,
+                    error_sink: error_sink.clone(),
+                }
+                .into();
                 let data = texture_id
                     .map(|id| CoreTexture {
                         context: self.context.clone(),
                         id,
-                        error_sink,
+                        error_sink: error_sink.clone(),
                     })
                     .map(Into::into);
 
                 (data, status, output_detail)
             }
             Err(err) => {
+                let output_detail = CoreSurfaceOutputDetail {
+                    context: self.context.clone(),
+                    surface_id: self.id,
+                    texture_id: None,
+                    error_sink: error_sink.clone(),
+                }
+                .into();
                 let error_sink = self.error_sink.lock();
                 match error_sink.as_ref() {
                     Some(error_sink) => {
@@ -3946,7 +3954,14 @@ impl Drop for CoreSurface {
 
 impl dispatch::SurfaceOutputDetailInterface for CoreSurfaceOutputDetail {
     fn present(&self) {
-        match self.context.0.surface_present(self.surface_id) {
+        let result = match self.texture_id {
+            Some(texture_id) => self
+                .context
+                .0
+                .surface_present_acquired(self.surface_id, texture_id),
+            None => Err(wgc::present::SurfaceError::AlreadyAcquired),
+        };
+        match result {
             Ok(_status) => (),
             Err(err) => {
                 self.context
@@ -3955,12 +3970,38 @@ impl dispatch::SurfaceOutputDetailInterface for CoreSurfaceOutputDetail {
         }
     }
 
+    fn present_with_feedback(&self, callback: dispatch::PresentationFeedbackCallback) {
+        let Some(texture_id) = self.texture_id else {
+            callback(Err(crate::PresentationFeedbackError::Validation));
+            return;
+        };
+        if let Err(err) = self.context.0.surface_present_acquired_with_feedback(
+            self.surface_id,
+            texture_id,
+            callback,
+        ) {
+            self.context.handle_error_nolabel(
+                &self.error_sink,
+                err,
+                "SurfaceTexture::present_with_feedback",
+            );
+        }
+    }
+
     fn texture_discard(&self) {
-        match self.context.0.surface_texture_discard(self.surface_id) {
-            Ok(_status) => (),
-            Err(err) => self
+        let result = match self.texture_id {
+            Some(texture_id) => self
                 .context
-                .handle_error_fatal(err, "Surface::discard_texture"),
+                .0
+                .surface_texture_discard_acquired(self.surface_id, texture_id),
+            None => Err(wgc::present::SurfaceError::AlreadyAcquired),
+        };
+        match result {
+            Ok(_status) => (),
+            Err(err) => {
+                self.context
+                    .handle_error_nolabel(&self.error_sink, err, "Surface::discard_texture")
+            }
         }
     }
 }
