@@ -309,6 +309,14 @@ use raw_window_handle::DisplayHandle;
 use thiserror::Error;
 use wgt::WasmNotSendSync;
 
+/// Completion for terminal feedback about one exact surface presentation.
+#[cfg(send_sync)]
+pub type PresentationFeedbackCallback =
+    Box<dyn FnOnce(wgt::PresentationFeedbackResult) + Send + 'static>;
+/// Completion for terminal feedback about one exact surface presentation.
+#[cfg(not(send_sync))]
+pub type PresentationFeedbackCallback = Box<dyn FnOnce(wgt::PresentationFeedbackResult) + 'static>;
+
 cfg_if::cfg_if! {
     if #[cfg(supports_ptr_atomics)] {
         use alloc::sync::Arc;
@@ -1250,6 +1258,28 @@ pub trait Queue: WasmNotSendSync {
         surface: &<Self::A as Api>::Surface,
         texture: <Self::A as Api>::SurfaceTexture,
     ) -> Result<(), SurfaceError>;
+    /// Present one exact surface texture and request terminal display feedback.
+    ///
+    /// The default implementation performs ordinary presentation and then reports that terminal
+    /// feedback is unsupported. Implementations must not substitute queue completion or scheduling
+    /// completion for terminal presentation evidence.
+    ///
+    /// # Safety
+    ///
+    /// This has the same requirements as [`Queue::present`]. The callback must be completed at
+    /// most once and must refer only to the exact `texture` consumed by this call.
+    unsafe fn present_with_feedback(
+        &self,
+        surface: &<Self::A as Api>::Surface,
+        texture: <Self::A as Api>::SurfaceTexture,
+        callback: PresentationFeedbackCallback,
+    ) -> Result<(), SurfaceError> {
+        let result = unsafe { self.present(surface, texture) };
+        if result.is_ok() {
+            callback(Err(wgt::PresentationFeedbackError::Unsupported));
+        }
+        result
+    }
     unsafe fn get_timestamp_period(&self) -> f32;
 }
 

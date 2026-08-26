@@ -42,6 +42,17 @@ Bottom level categories:
 
 ## Unreleased
 
+### Added/New Features
+
+#### General
+
+- Add terminal presentation feedback for an exact acquired surface texture.
+
+#### Metal
+
+- Report exact presented/not-presented outcomes and presentation timestamps from the matching
+  `MTLDrawable` presented-handler callback.
+
 ## v29.0.4 (2026-07-01)
 
 ### New Features

@@ -6,6 +6,10 @@ use crate::*;
 /// This type is unique to the Rust API of `wgpu`. In the WebGPU specification,
 /// the [`GPUCanvasContext`](https://gpuweb.github.io/gpuweb/#canvas-context) provides
 /// a texture without any additional information.
+///
+/// Clones share one exact acquisition. Presenting or discarding through one clone consumes that
+/// acquisition for all siblings. A stale sibling can never act on a later surface texture
+/// acquired from the same surface.
 #[derive(Debug, Clone)]
 pub struct SurfaceTexture {
     /// Accessible view of the frame.
@@ -31,6 +35,18 @@ impl SurfaceTexture {
     pub fn present(mut self) {
         self.presented = true;
         self.detail.present();
+    }
+
+    /// Schedule this exact texture for presentation and observe its terminal display outcome.
+    ///
+    /// Successful queue submission or a successful platform present call does not complete the
+    /// returned future as presented. Backends without terminal display evidence resolve it as
+    /// unsupported after performing the ordinary presentation operation.
+    pub fn present_with_feedback(mut self) -> PresentationFeedbackFuture {
+        self.presented = true;
+        let (future, callback) = PresentationFeedbackFuture::pending();
+        self.detail.present_with_feedback(callback);
+        future
     }
 
     #[cfg(custom)]

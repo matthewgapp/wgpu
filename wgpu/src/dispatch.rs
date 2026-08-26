@@ -65,6 +65,11 @@ pub type BoxSubmittedWorkDoneCallback = Box<dyn FnOnce() + Send + 'static>;
 #[cfg(not(send_sync))]
 pub type BoxSubmittedWorkDoneCallback = Box<dyn FnOnce() + 'static>;
 #[cfg(send_sync)]
+pub type PresentationFeedbackCallback =
+    Box<dyn FnOnce(wgt::PresentationFeedbackResult) + Send + 'static>;
+#[cfg(not(send_sync))]
+pub type PresentationFeedbackCallback = Box<dyn FnOnce(wgt::PresentationFeedbackResult) + 'static>;
+#[cfg(send_sync)]
 pub type BufferMapCallback = Box<dyn FnOnce(Result<(), crate::BufferAsyncError>) + Send + 'static>;
 #[cfg(not(send_sync))]
 pub type BufferMapCallback = Box<dyn FnOnce(Result<(), crate::BufferAsyncError>) + 'static>;
@@ -579,6 +584,10 @@ pub trait SurfaceInterface: CommonTraits {
 
 pub trait SurfaceOutputDetailInterface: CommonTraits {
     fn present(&self);
+    fn present_with_feedback(&self, callback: PresentationFeedbackCallback) {
+        self.present();
+        callback(Err(wgt::PresentationFeedbackError::Unsupported));
+    }
     fn texture_discard(&self);
 }
 

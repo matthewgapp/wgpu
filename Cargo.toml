@@ -222,6 +222,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 objc2-metal = { version = "0.3.2", default-features = false, features = [
     "std",
     "block2",
+    "objc2-core-foundation",
     "MTLAllocation",
     "MTLBlitCommandEncoder",
     "MTLBlitPass",

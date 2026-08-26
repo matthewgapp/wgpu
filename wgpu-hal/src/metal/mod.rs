@@ -31,7 +31,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{fmt, iter, ops, ptr::NonNull, sync::atomic};
+use core::{fmt, iter, ops, panic::AssertUnwindSafe, ptr::NonNull, sync::atomic};
 
 use bitflags::bitflags;
 use hashbrown::HashMap;
@@ -537,6 +537,133 @@ impl core::borrow::Borrow<dyn crate::DynTexture> for SurfaceTexture {
 unsafe impl Send for SurfaceTexture {}
 unsafe impl Sync for SurfaceTexture {}
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+struct MetalPresentationFeedbackCompletion {
+    callback: Mutex<Option<crate::PresentationFeedbackCallback>>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl MetalPresentationFeedbackCompletion {
+    fn new(callback: crate::PresentationFeedbackCallback) -> Self {
+        Self {
+            callback: Mutex::new(Some(callback)),
+        }
+    }
+
+    fn complete(&self, result: wgt::PresentationFeedbackResult) {
+        let callback = self.callback.lock().take();
+        let Some(callback) = callback else {
+            log::warn!("Metal presentation feedback completed more than once");
+            return;
+        };
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| callback(result)));
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl Drop for MetalPresentationFeedbackCompletion {
+    fn drop(&mut self) {
+        let callback = self.callback.lock().take();
+        if let Some(callback) = callback {
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                callback(Err(wgt::PresentationFeedbackError::Cancelled));
+            }));
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn metal_presentation_feedback(presented_time: f64) -> wgt::PresentationFeedbackResult {
+    if presented_time == 0.0 {
+        return Ok(wgt::PresentationFeedback::NotPresented);
+    }
+    if !presented_time.is_finite() || presented_time < 0.0 {
+        return Err(wgt::PresentationFeedbackError::ProtocolFailure);
+    }
+
+    let nanoseconds = presented_time * 1_000_000_000.0;
+    if !nanoseconds.is_finite() || nanoseconds < 1.0 || nanoseconds >= u128::MAX as f64 {
+        return Err(wgt::PresentationFeedbackError::ProtocolFailure);
+    }
+
+    Ok(wgt::PresentationFeedback::Presented {
+        timestamp: wgt::PresentationTimestamp(nanoseconds as u128),
+    })
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+mod presentation_feedback_tests {
+    use alloc::boxed::Box;
+
+    use super::*;
+
+    #[test]
+    fn presented_time_classification_is_terminal_and_strict() {
+        assert_eq!(
+            metal_presentation_feedback(0.0),
+            Ok(wgt::PresentationFeedback::NotPresented)
+        );
+        assert_eq!(
+            metal_presentation_feedback(1.25),
+            Ok(wgt::PresentationFeedback::Presented {
+                timestamp: wgt::PresentationTimestamp(1_250_000_000),
+            })
+        );
+        for invalid in [
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,
+        ] {
+            assert_eq!(
+                metal_presentation_feedback(invalid),
+                Err(wgt::PresentationFeedbackError::ProtocolFailure)
+            );
+        }
+    }
+
+    #[test]
+    fn completion_is_exactly_once() {
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&results);
+        let completion = MetalPresentationFeedbackCompletion::new(Box::new(move |result| {
+            captured.lock().push(result);
+        }));
+        completion.complete(Ok(wgt::PresentationFeedback::NotPresented));
+        completion.complete(Err(wgt::PresentationFeedbackError::ProtocolFailure));
+        drop(completion);
+
+        assert_eq!(
+            *results.lock(),
+            [Ok(wgt::PresentationFeedback::NotPresented)]
+        );
+    }
+
+    #[test]
+    fn block_destruction_cancels_pending_feedback() {
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&results);
+        let completion = MetalPresentationFeedbackCompletion::new(Box::new(move |result| {
+            captured.lock().push(result);
+        }));
+        drop(completion);
+
+        assert_eq!(
+            *results.lock(),
+            [Err(wgt::PresentationFeedbackError::Cancelled)]
+        );
+    }
+
+    #[test]
+    fn completion_panic_does_not_cross_native_boundary() {
+        let completion = MetalPresentationFeedbackCompletion::new(Box::new(|_| {
+            panic!("hostile feedback callback");
+        }));
+        completion.complete(Ok(wgt::PresentationFeedback::NotPresented));
+    }
+}
+
 impl crate::Queue for Queue {
     type A = Api;
 
@@ -624,6 +751,78 @@ impl crate::Queue for Queue {
             }
         });
         Ok(())
+    }
+
+    unsafe fn present_with_feedback(
+        &self,
+        surface: &Surface,
+        texture: SurfaceTexture,
+        callback: crate::PresentationFeedbackCallback,
+    ) -> Result<(), crate::SurfaceError> {
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            let result = unsafe { self.present(surface, texture) };
+            if result.is_ok() {
+                callback(Err(wgt::PresentationFeedbackError::Unsupported));
+            }
+            return result;
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let feedback_available = if cfg!(target_abi = "macabi") {
+                available!(ios = 13.4)
+            } else {
+                available!(macos = 10.15.4, ios = 10.3)
+            };
+            if !feedback_available {
+                let result = unsafe { self.present(surface, texture) };
+                if result.is_ok() {
+                    callback(Err(wgt::PresentationFeedbackError::Unsupported));
+                }
+                return result;
+            }
+
+            autoreleasepool(|_| {
+                let expected_address = Retained::as_ptr(&texture.drawable).cast::<()>();
+                let expected_id = texture.drawable.drawableID();
+                let completion = MetalPresentationFeedbackCompletion::new(callback);
+                let block = block2::RcBlock::new(
+                    move |drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                        let actual_address = drawable.as_ptr().cast_const().cast::<()>();
+                        let actual = unsafe { drawable.as_ref() };
+                        let result = if actual_address != expected_address
+                            || actual.drawableID() != expected_id
+                        {
+                            Err(wgt::PresentationFeedbackError::ProtocolFailure)
+                        } else {
+                            metal_presentation_feedback(actual.presentedTime())
+                        };
+                        completion.complete(result);
+                    },
+                );
+                unsafe {
+                    texture
+                        .drawable
+                        .addPresentedHandler(block2::RcBlock::as_ptr(&block));
+                }
+
+                let command_buffer = self.shared.raw.commandBuffer().unwrap();
+                command_buffer.setLabel(Some(ns_string!("(wgpu internal) Present with Feedback")));
+
+                if !texture.present_with_transaction {
+                    command_buffer.presentDrawable(&texture.drawable);
+                }
+
+                command_buffer.commit();
+
+                if texture.present_with_transaction {
+                    command_buffer.waitUntilScheduled();
+                    texture.drawable.present();
+                }
+            });
+            Ok(())
+        }
     }
 
     unsafe fn get_timestamp_period(&self) -> f32 {
