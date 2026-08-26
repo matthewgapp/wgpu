@@ -175,6 +175,13 @@ fn take_exact_acquisition<T>(
     Ok(acquired.take().unwrap())
 }
 
+fn take_exact_acquisition_for_discard<T>(
+    acquired: &mut Option<Arc<T>>,
+    expected: &Arc<T>,
+) -> Option<Arc<T>> {
+    take_exact_acquisition(acquired, Some(expected)).ok()
+}
+
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum ConfigureSurfaceError {
@@ -558,7 +565,17 @@ impl Surface {
 
         device.check_is_valid()?;
 
-        let texture = take_exact_acquisition(&mut present.acquired_texture, expected)?;
+        let texture = match expected {
+            Some(expected) => {
+                let Some(texture) =
+                    take_exact_acquisition_for_discard(&mut present.acquired_texture, expected)
+                else {
+                    return Ok(());
+                };
+                texture
+            }
+            None => take_exact_acquisition(&mut present.acquired_texture, None)?,
+        };
 
         let mut exclusive_snatch_guard = device.snatchable_lock.write();
         let inner = texture.inner.snatch(&mut exclusive_snatch_guard);
@@ -766,5 +783,20 @@ mod presentation_feedback_tests {
             take_exact_acquisition(&mut acquired, Some(&second)),
             Err(SurfaceError::AlreadyAcquired)
         ));
+    }
+
+    #[test]
+    fn stale_clone_discard_is_idempotent_and_preserves_a_later_texture() {
+        let first = Arc::new(());
+        let second = Arc::new(());
+        let mut acquired = Some(Arc::clone(&second));
+
+        assert!(take_exact_acquisition_for_discard(&mut acquired, &first).is_none());
+        assert!(Arc::ptr_eq(acquired.as_ref().unwrap(), &second));
+        assert!(Arc::ptr_eq(
+            &take_exact_acquisition_for_discard(&mut acquired, &second).unwrap(),
+            &second
+        ));
+        assert!(take_exact_acquisition_for_discard(&mut acquired, &second).is_none());
     }
 }
